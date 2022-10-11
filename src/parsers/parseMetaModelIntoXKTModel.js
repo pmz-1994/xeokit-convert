@@ -7,13 +7,18 @@
  * @param {String[]} [params.includeTypes] Types to include in parsing.
  * @param {XKTModel} params.xktModel XKTModel to parse into.
  * @param {function} [params.log] Logging callback.
- * @returns {Promise}
+ @returns {Promise} Resolves when JSON has been parsed.
  */
 function parseMetaModelIntoXKTModel({metaModelData, xktModel, includeTypes, excludeTypes, log}) {
+
+    if (log) {
+        log("Using parser: parseMetaModelIntoXKTModel");
+    }
 
     return new Promise(function (resolve, reject) {
 
         const metaObjects = metaModelData.metaObjects || [];
+        const propertySets = metaModelData.propertySets || [];
 
         xktModel.modelId = metaModelData.revisionId || ""; // HACK
         xktModel.projectId = metaModelData.projectId || "";
@@ -22,6 +27,18 @@ function parseMetaModelIntoXKTModel({metaModelData, xktModel, includeTypes, excl
         xktModel.createdAt = metaModelData.createdAt || "";
         xktModel.creatingApplication = metaModelData.creatingApplication || "";
         xktModel.schema = metaModelData.schema || "";
+
+        for (let i = 0, len = propertySets.length; i < len; i++) {
+
+            const propertySet = propertySets[i];
+
+            xktModel.createPropertySet({
+                propertySetId: propertySet.id,
+                propertySetName: propertySet.name,
+                propertySetType: propertySet.type,
+                properties: propertySet.properties
+            });
+        }
 
         let includeTypesMap;
         if (includeTypes) {
@@ -64,15 +81,29 @@ function parseMetaModelIntoXKTModel({metaModelData, xktModel, includeTypes, excl
             if (metaObject.parent !== undefined && metaObject.parent !== null) {
                 const metaObjectParent = metaObjectsMap[metaObject.parent];
                 if (metaObject.type === metaObjectParent.type) { // Don't create redundant sub-objects
-                   continue
+                    continue
                 }
+            }
+
+            const propertySetIds = [];
+            if (metaObject.propertySetIds) {
+                for (let j = 0, lenj = metaObject.propertySetIds.length; j < lenj; j++) {
+                    const propertySetId = metaObject.propertySetIds[j];
+                    if (propertySetId !== undefined && propertySetId !== null && propertySetId !== "") {
+                        propertySetIds.push(propertySetId);
+                    }
+                }
+            }
+            if (metaObject.propertySetId !== undefined && metaObject.propertySetId !== null && metaObject.propertySetId !== "") {
+                propertySetIds.push(metaObject.propertySetId);
             }
 
             xktModel.createMetaObject({
                 metaObjectId: metaObject.id,
                 metaObjectType: metaObject.type,
                 metaObjectName: metaObject.name,
-                parentMetaObjectId: metaObject.parent
+                parentMetaObjectId: metaObject.parent,
+                propertySetIds: propertySetIds.length > 0 ? propertySetIds : null
             });
 
             countMetaObjects++;

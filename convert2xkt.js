@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 
 const commander = require('commander');
-const package = require('./package.json');
-const {XKT_INFO} = require("./dist/xeokit-convert.cjs.js");
-const convert2xkt = require('./dist/convert2xkt.cjs.js');
+const npmPackage = require('./package.json');
+const {convert2xkt, XKT_INFO} = require("./dist/xeokit-convert.cjs.js");
 const fs = require('fs');
+
+const WebIFC = require("web-ifc/web-ifc-api-node.js");
 
 const program = new commander.Command();
 
-program.version(package.version, '-v, --version');
+program.version(npmPackage.version, '-v, --version');
 
 program
     .option('-s, --source [file]', 'path to source file')
@@ -17,8 +18,12 @@ program
     .option('-i, --include [types]', 'only convert these types (optional)')
     .option('-x, --exclude [types]', 'never convert these types (optional)')
     .option('-r, --rotatex', 'rotate model 90 degrees about X axis (for las and cityjson)')
+    .option('-g, --disablegeoreuse', 'disable geometry reuse (optional)')
+    .option('-z, --mintilesize [number]', 'minimum diagonal tile size (optional, default 500)')
+    .option('-t, --disabletextures', 'ignore textures (optional)')
+    .option('-n, --disablenormals', 'ignore normals (optional)')
     .option('-o, --output [file]', 'path to target .xkt file; creates directories on path automatically if not existing')
-    .option('-l, --log', 'enable logging');
+    .option('-l, --log', 'enable logging (optional)');
 
 program.on('--help', () => {
     console.log(`\n\nXKT version: ${XKT_INFO.xktVersion}`);
@@ -47,15 +52,15 @@ function log(msg) {
 }
 
 async function main() {
-
     if (options.output) {
         const outputDir = getBasePath(options.output).trim();
         if (outputDir !== "" && !fs.existsSync(outputDir)) {
             fs.mkdirSync(outputDir, {recursive: true});
         }
     }
-
-    const result = await convert2xkt({
+    log(`[convert2xkt] Running convert2xkt v${npmPackage.version}...`);
+    convert2xkt({
+        WebIFC,
         source: options.source,
         format: options.format,
         metaModelSource: options.metamodel,
@@ -63,12 +68,18 @@ async function main() {
         includeTypes: options.include ? options.include.slice(",") : null,
         excludeTypes: options.exclude ? options.exclude.slice(",") : null,
         rotateX: options.rotatex,
+        reuseGeometries: (options.disablegeoreuse !== true),
+        minTileSize: options.mintilesize,
+        includeTextures: options.textures,
+        includeNormals: options.normals,
         log
-    });
-
-    if (result < 0) {
+    }).then(() => {
+        log(`[convert2xkt] Done.`);
+        process.exit(0);
+    }).catch((err) => {
+        console.error(`Error: ${err}`);
         process.exit(1);
-    }
+    });
 }
 
 function getBasePath(src) {

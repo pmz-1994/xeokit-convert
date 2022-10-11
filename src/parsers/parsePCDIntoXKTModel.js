@@ -29,9 +29,13 @@
  * @param {XKTModel} params.xktModel XKTModel to parse into.
  * @param {Object} [params.stats] Collects statistics.
  * @param {function} [params.log] Logging callback.
- * @returns {Promise}
+ @returns {Promise} Resolves when PCD has been parsed.
  */
 function parsePCDIntoXKTModel({data, xktModel, littleEndian = true, stats, log}) {
+
+    if (log) {
+        log("Using parser: parsePCDIntoXKTModel");
+    }
 
     return new Promise(function(resolve, reject) {
 

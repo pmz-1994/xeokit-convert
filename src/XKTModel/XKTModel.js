@@ -12,6 +12,12 @@ import {XKTMetaObject} from "./XKTMetaObject.js";
 import {XKTPropertySet} from "./XKTPropertySet.js";
 import {mergeVertices} from "../lib/mergeVertices.js";
 import {XKT_INFO} from "../XKT_INFO.js";
+import {XKTTexture} from "./XKTTexture";
+import {XKTTextureSet} from "./XKTTextureSet";
+import {encode} from "@loaders.gl/core";
+import {KTX2BasisWriter} from "@loaders.gl/textures";
+import {ImageLoader} from '@loaders.gl/images';
+import {load} from '@loaders.gl/core';
 
 const tempVec4a = math.vec4([0, 0, 0, 1]);
 const tempVec4b = math.vec4([0, 0, 0, 1]);
@@ -19,9 +25,49 @@ const tempVec4b = math.vec4([0, 0, 0, 1]);
 const tempMat4 = math.mat4();
 const tempMat4b = math.mat4();
 
-const MIN_TILE_DIAG = 10000;
-
 const kdTreeDimLength = new Float64Array(3);
+
+// XKT texture types
+
+const COLOR_TEXTURE = 0;
+const METALLIC_ROUGHNESS_TEXTURE = 1;
+const NORMALS_TEXTURE = 2;
+const EMISSIVE_TEXTURE = 3;
+const OCCLUSION_TEXTURE = 4;
+
+// KTX2 encoding options for each texture type
+
+const TEXTURE_ENCODING_OPTIONS = {}
+TEXTURE_ENCODING_OPTIONS[COLOR_TEXTURE] = {
+    useSRGB: true,
+    qualityLevel: 50,
+    encodeUASTC: true,
+    mipmaps: true
+};
+TEXTURE_ENCODING_OPTIONS[EMISSIVE_TEXTURE] = {
+    useSRGB: true,
+    encodeUASTC: true,
+    qualityLevel: 10,
+    mipmaps: false
+};
+TEXTURE_ENCODING_OPTIONS[METALLIC_ROUGHNESS_TEXTURE] = {
+    useSRGB: false,
+    encodeUASTC: true,
+    qualityLevel: 50,
+    mipmaps: true // Needed for GGX roughness shading
+};
+TEXTURE_ENCODING_OPTIONS[NORMALS_TEXTURE] = {
+    useSRGB: false,
+    encodeUASTC: true,
+    qualityLevel: 10,
+    mipmaps: false
+};
+TEXTURE_ENCODING_OPTIONS[OCCLUSION_TEXTURE] = {
+    useSRGB: false,
+    encodeUASTC: true,
+    qualityLevel: 10,
+    mipmaps: false
+};
 
 /**
  * A document model that represents the contents of an .XKT file.
@@ -29,7 +75,7 @@ const kdTreeDimLength = new Float64Array(3);
  * * An XKTModel contains {@link XKTTile}s, which spatially subdivide the model into axis-aligned, box-shaped regions.
  * * Each {@link XKTTile} contains {@link XKTEntity}s, which represent the objects within its region.
  * * Each {@link XKTEntity} has {@link XKTMesh}s, which each have a {@link XKTGeometry}. Each {@link XKTGeometry} can be shared by multiple {@link XKTMesh}s.
- * * Import models into an XKTModel using {@link parseGLTFIntoXKTModel}, {@link parseIFCIntoXKTModel}, {@link parse3DXMLIntoXKTModel}, {@link parseCityJSONIntoXKTModel} etc.
+ * * Import models into an XKTModel using {@link parseGLTFJSONIntoXKTModel}, {@link parseIFCIntoXKTModel}, {@link parseCityJSONIntoXKTModel} etc.
  * * Build an XKTModel programmatically using {@link XKTModel#createGeometry}, {@link XKTModel#createMesh} and {@link XKTModel#createEntity}.
  * * Serialize an XKTModel to an ArrayBuffer using {@link writeXKTModelToArrayBuffer}.
  *
@@ -46,6 +92,7 @@ class XKTModel {
      *
      * @param {*} [cfg] Configuration
      * @param {Number} [cfg.edgeThreshold=10]
+     * @param {Number} [cfg.minTileSize=500]
      */
     constructor(cfg = {}) {
 
@@ -124,13 +171,20 @@ class XKTModel {
          * @property xktVersion;
          * @type {number}
          */
-        this.xktVersion =  XKT_INFO.xktVersion;
+        this.xktVersion = XKT_INFO.xktVersion;
 
         /**
          *
          * @type {Number|number}
          */
         this.edgeThreshold = cfg.edgeThreshold || 10;
+
+        /**
+         * Minimum diagonal size of the boundary of an {@link XKTTile}.
+         *
+         * @type {Number|number}
+         */
+        this.minTileSize = cfg.minTileSize || 500;
 
         /**
          * Map of {@link XKTPropertySet}s within this XKTModel, each mapped to {@link XKTPropertySet#propertySetId}.
@@ -202,6 +256,46 @@ class XKTModel {
          * @type {XKTGeometry[]}
          */
         this.geometriesList = [];
+
+        /**
+         * Map of {@link XKTTexture}s within this XKTModel, each mapped to {@link XKTTexture#textureId}.
+         *
+         * Created by {@link XKTModel#createTexture}.
+         *
+         * @type {{Number:XKTTexture}}
+         */
+        this.textures = {};
+
+        /**
+         * List of {@link XKTTexture}s within this XKTModel, in the order they were created.
+         *
+         * Each XKTTexture holds its position in this list in {@link XKTTexture#textureIndex}.
+         *
+         * Created by {@link XKTModel#finalize}.
+         *
+         * @type {XKTTexture[]}
+         */
+        this.texturesList = [];
+
+        /**
+         * Map of {@link XKTTextureSet}s within this XKTModel, each mapped to {@link XKTTextureSet#textureSetId}.
+         *
+         * Created by {@link XKTModel#createTextureSet}.
+         *
+         * @type {{Number:XKTTextureSet}}
+         */
+        this.textureSets = {};
+
+        /**
+         * List of {@link XKTTextureSet}s within this XKTModel, in the order they were created.
+         *
+         * Each XKTTextureSet holds its position in this list in {@link XKTTextureSet#textureSetIndex}.
+         *
+         * Created by {@link XKTModel#finalize}.
+         *
+         * @type {XKTTextureSet[]}
+         */
+        this.textureSetsList = [];
 
         /**
          * Map of {@link XKTMesh}s within this XKTModel, each mapped to {@link XKTMesh#meshId}.
@@ -377,7 +471,194 @@ class XKTModel {
     }
 
     /**
+     * Creates an {@link XKTTexture} within this XKTModel.
+     *
+     * Registers the new {@link XKTTexture} in {@link XKTModel#textures} and {@link XKTModel#texturesList}.
+     *
+     * Logs error and does nothing if this XKTModel has been finalized (see {@link XKTModel#finalized}).
+     *
+     * @param {*} params Method parameters.
+     * @param {Number} params.textureId Unique ID for the {@link XKTTexture}.
+     * @param {String} [params.src] Source of an image file for the texture.
+     * @param {Buffer} [params.imageData] Image data for the texture.
+     * @param {Number} [params.mediaType] Media type (ie. MIME type) of ````imageData````. Supported values are {@link GIFMediaType}, {@link PNGMediaType} and {@link JPEGMediaType}.
+     * @param {Number} [params.width] Texture width, used with ````imageData````. Ignored for compressed textures.
+     * @param {Number} [params.height] Texture height, used with ````imageData````. Ignored for compressed textures.
+     * @param {Boolean} [params.compressed=true] Whether to compress the texture.
+     * @param {Number} [params.minFilter=LinearMipMapNearestFilter] How the texture is sampled when a texel covers less than one pixel. Supported
+     * values are {@link LinearMipmapLinearFilter}, {@link LinearMipMapNearestFilter}, {@link NearestMipMapNearestFilter},
+     * {@link NearestMipMapLinearFilter} and {@link LinearMipMapLinearFilter}. Ignored for compressed textures.
+     * @param {Number} [params.magFilter=LinearMipMapNearestFilter] How the texture is sampled when a texel covers more than one pixel. Supported values
+     * are {@link LinearFilter} and {@link NearestFilter}. Ignored for compressed textures.
+     * @param {Number} [params.wrapS=RepeatWrapping] Wrap parameter for texture coordinate *S*. Supported values are {@link ClampToEdgeWrapping},
+     * {@link MirroredRepeatWrapping} and {@link RepeatWrapping}. Ignored for compressed textures.
+     * @param {Number} [params.wrapT=RepeatWrapping] Wrap parameter for texture coordinate *T*. Supported values are {@link ClampToEdgeWrapping},
+     * {@link MirroredRepeatWrapping} and {@link RepeatWrapping}. Ignored for compressed textures.
+     * {@param {Number} [params.wrapR=RepeatWrapping] Wrap parameter for texture coordinate *R*. Supported values are {@link ClampToEdgeWrapping},
+     * {@link MirroredRepeatWrapping} and {@link RepeatWrapping}. Ignored for compressed textures.
+     * @returns {XKTTexture} The new {@link XKTTexture}.
+     */
+    createTexture(params) {
+
+        if (!params) {
+            throw "Parameters expected: params";
+        }
+
+        if (params.textureId === null || params.textureId === undefined) {
+            throw "Parameter expected: params.textureId";
+        }
+
+        if (!params.imageData && !params.src) {
+            throw "Parameter expected: params.imageData or params.src";
+        }
+
+        if (this.finalized) {
+            console.error("XKTModel has been finalized, can't add more textures");
+            return;
+        }
+
+        if (this.textures[params.textureId]) {
+            console.error("XKTTexture already exists with this ID: " + params.textureId);
+            return;
+        }
+
+        if (params.src) {
+            const fileExt = params.src.split('.').pop();
+            if (fileExt !== "jpg" && fileExt !== "jpeg" && fileExt !== "png") {
+                console.error(`XKTModel does not support image files with extension '${fileExt}' - won't create texture '${params.textureId}`);
+                return;
+            }
+        }
+
+        const textureId = params.textureId;
+
+        const texture = new XKTTexture({
+            textureId,
+            imageData: params.imageData,
+            mediaType: params.mediaType,
+            minFilter: params.minFilter,
+            magFilter: params.magFilter,
+            wrapS: params.wrapS,
+            wrapT: params.wrapT,
+            wrapR: params.wrapR,
+            width: params.width,
+            height: params.height,
+            compressed: (params.compressed !== false),
+            src: params.src
+        });
+
+        this.textures[textureId] = texture;
+        this.texturesList.push(texture);
+
+        return texture;
+    }
+
+    /**
+     * Creates an {@link XKTTextureSet} within this XKTModel.
+     *
+     * Registers the new {@link XKTTextureSet} in {@link XKTModel#textureSets} and {@link XKTModel#.textureSetsList}.
+     *
+     * Logs error and does nothing if this XKTModel has been finalized (see {@link XKTModel#finalized}).
+     *
+     * @param {*} params Method parameters.
+     * @param {Number} params.textureSetId Unique ID for the {@link XKTTextureSet}.
+     * @param {*} [params.colorTextureId] ID of *RGBA* base color {@link XKTTexture}, with color in *RGB* and alpha in *A*.
+     * @param {*} [params.metallicRoughnessTextureId] ID of *RGBA* metal-roughness {@link XKTTexture}, with the metallic factor in *R*, and roughness factor in *G*.
+     * @param {*} [params.normalsTextureId] ID of *RGBA* normal {@link XKTTexture}, with normal map vectors in *RGB*.
+     * @param {*} [params.emissiveTextureId] ID of *RGBA* emissive {@link XKTTexture}, with emissive color in *RGB*.
+     * @param {*} [params.occlusionTextureId] ID of *RGBA* occlusion {@link XKTTexture}, with occlusion factor in *R*.
+     * @returns {XKTTextureSet} The new {@link XKTTextureSet}.
+     */
+    createTextureSet(params) {
+
+        if (!params) {
+            throw "Parameters expected: params";
+        }
+
+        if (params.textureSetId === null || params.textureSetId === undefined) {
+            throw "Parameter expected: params.textureSetId";
+        }
+
+        if (this.finalized) {
+            console.error("XKTModel has been finalized, can't add more textureSets");
+            return;
+        }
+
+        if (this.textureSets[params.textureSetId]) {
+            console.error("XKTTextureSet already exists with this ID: " + params.textureSetId);
+            return;
+        }
+
+        let colorTexture;
+        if (params.colorTextureId !== undefined && params.colorTextureId !== null) {
+            colorTexture = this.textures[params.colorTextureId];
+            if (!colorTexture) {
+                console.error(`Texture not found: ${params.colorTextureId} - ensure that you create it first with createTexture()`);
+                return;
+            }
+            colorTexture.channel = COLOR_TEXTURE;
+        }
+
+        let metallicRoughnessTexture;
+        if (params.metallicRoughnessTextureId !== undefined && params.metallicRoughnessTextureId !== null) {
+            metallicRoughnessTexture = this.textures[params.metallicRoughnessTextureId];
+            if (!metallicRoughnessTexture) {
+                console.error(`Texture not found: ${params.metallicRoughnessTextureId} - ensure that you create it first with createTexture()`);
+                return;
+            }
+            metallicRoughnessTexture.channel = METALLIC_ROUGHNESS_TEXTURE;
+        }
+
+        let normalsTexture;
+        if (params.normalsTextureId !== undefined && params.normalsTextureId !== null) {
+            normalsTexture = this.textures[params.normalsTextureId];
+            if (!normalsTexture) {
+                console.error(`Texture not found: ${params.normalsTextureId} - ensure that you create it first with createTexture()`);
+                return;
+            }
+            normalsTexture.channel = NORMALS_TEXTURE;
+        }
+
+        let emissiveTexture;
+        if (params.emissiveTextureId !== undefined && params.emissiveTextureId !== null) {
+            emissiveTexture = this.textures[params.emissiveTextureId];
+            if (!emissiveTexture) {
+                console.error(`Texture not found: ${params.emissiveTextureId} - ensure that you create it first with createTexture()`);
+                return;
+            }
+            emissiveTexture.channel = EMISSIVE_TEXTURE;
+        }
+
+        let occlusionTexture;
+        if (params.occlusionTextureId !== undefined && params.occlusionTextureId !== null) {
+            occlusionTexture = this.textures[params.occlusionTextureId];
+            if (!occlusionTexture) {
+                console.error(`Texture not found: ${params.occlusionTextureId} - ensure that you create it first with createTexture()`);
+                return;
+            }
+            occlusionTexture.channel = OCCLUSION_TEXTURE;
+        }
+
+        const textureSet = new XKTTextureSet({
+            textureSetId: params.textureSetId,
+            textureSetIndex: this.textureSetsList.length,
+            colorTexture,
+            metallicRoughnessTexture,
+            normalsTexture,
+            emissiveTexture,
+            occlusionTexture
+        });
+
+        this.textureSets[params.textureSetId] = textureSet;
+        this.textureSetsList.push(textureSet);
+
+        return textureSet;
+    }
+
+    /**
      * Creates an {@link XKTGeometry} within this XKTModel.
+     *
+     * Registers the new {@link XKTGeometry} in {@link XKTModel#geometries} and {@link XKTModel#geometriesList}.
      *
      * Logs error and does nothing if this XKTModel has been finalized (see {@link XKTModel#finalized}).
      *
@@ -387,6 +668,9 @@ class XKTModel {
      * @param {Float64Array} params.positions Floating-point Local-space vertex positions for the {@link XKTGeometry}. Required for all primitive types.
      * @param {Number[]} [params.normals] Floating-point vertex normals for the {@link XKTGeometry}. Only used with triangles primitives. Ignored for points and lines.
      * @param {Number[]} [params.colors] Floating-point RGBA vertex colors for the {@link XKTGeometry}. Required for points primitives. Ignored for lines and triangles.
+     * @param {Number[]} [params.colorsCompressed] Integer RGBA vertex colors for the {@link XKTGeometry}. Required for points primitives. Ignored for lines and triangles.
+     * @param {Number[]} [params.uvs] Floating-point vertex UV coordinates for the {@link XKTGeometry}. Alias for ````uv````.
+     * @param {Number[]} [params.uv] Floating-point vertex UV coordinates for the {@link XKTGeometry}. Alias for ````uvs````.
      * @param {Number[]} [params.colorsCompressed] Integer RGBA vertex colors for the {@link XKTGeometry}. Required for points primitives. Ignored for lines and triangles.
      * @param {Uint32Array} [params.indices] Indices for the {@link XKTGeometry}. Required for triangles and lines primitives. Ignored for points.
      * @param {Number} [params.edgeThreshold=10]
@@ -454,7 +738,8 @@ class XKTModel {
             geometryId: geometryId,
             geometryIndex: this.geometriesList.length,
             primitiveType: primitiveType,
-            positions: positions
+            positions: positions,
+            uvs: params.uvs || params.uv
         }
 
         if (triangles) {
@@ -484,7 +769,7 @@ class XKTModel {
 
         if (triangles) {
 
-            if (!params.normals) {
+            if (!params.normals && !params.uv && !params.uvs) {
 
                 // Building models often duplicate positions to allow face-aligned vertex normals; when we're not
                 // providing normals for a geometry, it becomes possible to merge duplicate vertex positions within it.
@@ -514,10 +799,13 @@ class XKTModel {
      *
      * An {@link XKTMesh} can be owned by one {@link XKTEntity}, which can own multiple {@link XKTMesh}es.
      *
+     * Registers the new {@link XKTMesh} in {@link XKTModel#meshes} and {@link XKTModel#meshesList}.
+     *
      * @param {*} params Method parameters.
      * @param {Number} params.meshId Unique ID for the {@link XKTMesh}.
      * @param {Number} params.geometryId ID of an existing {@link XKTGeometry} in {@link XKTModel#geometries}.
-     * @param {Uint8Array} params.color RGB color for the {@link XKTMesh}, with each color component in range [0..1].
+     * @param {Number} [params.textureSetId] Unique ID of an {@link XKTTextureSet} in {@link XKTModel#textureSets}.
+     * @param {Float32Array} params.color RGB color for the {@link XKTMesh}, with each color component in range [0..1].
      * @param {Number} [params.metallic=0] How metallic the {@link XKTMesh} is, in range [0..1]. A value of ````0```` indicates fully dielectric material, while ````1```` indicates fully metallic.
      * @param {Number} [params.roughness=1] How rough the {@link XKTMesh} is, in range [0..1]. A value of ````0```` indicates fully smooth, while ````1```` indicates fully rough.
      * @param {Number} params.opacity Opacity factor for the {@link XKTMesh}, in range [0..1].
@@ -555,6 +843,16 @@ class XKTModel {
 
         geometry.numInstances++;
 
+        let textureSet = null;
+        if (params.textureSetId) {
+            textureSet = this.textureSets[params.textureSetId];
+            if (!textureSet) {
+                console.error("XKTTextureSet not found: " + params.textureSetId);
+                return;
+            }
+            textureSet.numInstances++;
+        }
+
         let matrix = params.matrix;
 
         if (!matrix) {
@@ -577,13 +875,14 @@ class XKTModel {
 
         const mesh = new XKTMesh({
             meshId: params.meshId,
-            meshIndex: meshIndex,
-            matrix: matrix,
-            geometry: geometry,
+            meshIndex,
+            matrix,
+            geometry,
             color: params.color,
             metallic: params.metallic,
             roughness: params.roughness,
-            opacity: params.opacity
+            opacity: params.opacity,
+            textureSet
         });
 
         this.meshes[mesh.meshId] = mesh;
@@ -594,6 +893,8 @@ class XKTModel {
 
     /**
      * Creates an {@link XKTEntity} within this XKTModel.
+     *
+     * Registers the new {@link XKTEntity} in {@link XKTModel#entities} and {@link XKTModel#entitiesList}.
      *
      * Logs error and does nothing if this XKTModel has been finalized (see {@link XKTModel#finalized}).
      *
@@ -626,12 +927,15 @@ class XKTModel {
             return;
         }
 
-        if (this.entities[params.entityId]) {
-            console.error("XKTEntity already exists with this ID: " + params.entityId);
-            return;
+        let entityId = params.entityId;
+
+        if (this.entities[entityId]) {
+            while (this.entities[entityId]) {
+                entityId = math.createUUID();
+            }
+            console.error("XKTEntity already exists with this ID: " + params.entityId + " - substituting random ID instead: " + entityId);
         }
 
-        const entityId = params.entityId;
         const meshIds = params.meshIds;
         const meshes = [];
 
@@ -712,12 +1016,16 @@ class XKTModel {
      * * creates {@link XKTTile}s in {@link XKTModel#tilesList}, and
      * * sets {@link XKTModel#finalized} ````true````.
      */
-    finalize() {
+    async finalize() {
 
         if (this.finalized) {
             console.log("XKTModel already finalized");
             return;
         }
+
+        this._removeUnusedTextures();
+
+        await this._compressTextures();
 
         this._bakeSingleUseGeometryPositions();
 
@@ -738,6 +1046,109 @@ class XKTModel {
         this.aabb.set(rootKDNode.aabb);
 
         this.finalized = true;
+    }
+
+    _removeUnusedTextures() {
+        let texturesList = [];
+        const textures = {};
+        for (let i = 0, leni = this.texturesList.length; i < leni; i++) {
+            const texture = this.texturesList[i];
+            if (texture.channel !== null) {
+                texture.textureIndex = texturesList.length;
+                texturesList.push(texture);
+                textures[texture.textureId] = texture;
+            }
+        }
+        this.texturesList = texturesList;
+        this.textures = textures;
+    }
+
+    _compressTextures() {
+        let countTextures = this.texturesList.length;
+        return new Promise((resolve) => {
+            if (countTextures === 0) {
+                resolve();
+                return;
+            }
+            for (let i = 0, leni = this.texturesList.length; i < leni; i++) {
+                const texture = this.texturesList[i];
+                const encodingOptions = TEXTURE_ENCODING_OPTIONS[texture.channel] || {};
+
+                if (texture.src) {
+
+                    // XKTTexture created with XKTModel#createTexture({ src: ... })
+
+                    const src = texture.src;
+                    const fileExt = src.split('.').pop();
+                    switch (fileExt) {
+                        case "jpeg":
+                        case "jpg":
+                        case "png":
+                            load(src, ImageLoader, {
+                                image: {
+                                    type: "data"
+                                }
+                            }).then((imageData) => {
+                                if (texture.compressed) {
+                                    encode(imageData, KTX2BasisWriter, encodingOptions).then((encodedData) => {
+                                        const encodedImageData = new Uint8Array(encodedData);
+                                        texture.imageData = encodedImageData;
+                                        if (--countTextures <= 0) {
+                                            resolve();
+                                        }
+                                    }).catch((err) => {
+                                        console.error("[XKTModel.finalize] Failed to encode image: " + err);
+                                        if (--countTextures <= 0) {
+                                            resolve();
+                                        }
+                                    });
+                                } else {
+                                    texture.imageData = new Uint8Array(1);
+                                    if (--countTextures <= 0) {
+                                        resolve();
+                                    }
+                                }
+                            }).catch((err) => {
+                                console.error("[XKTModel.finalize] Failed to load image: " + err);
+                                if (--countTextures <= 0) {
+                                    resolve();
+                                }
+                            });
+                            break;
+                        default:
+                            if (--countTextures <= 0) {
+                                resolve();
+                            }
+                            break;
+                    }
+                }
+
+                if (texture.imageData) {
+
+                    // XKTTexture created with XKTModel#createTexture({ imageData: ... })
+
+                    if (texture.compressed) {
+                        encode(texture.imageData, KTX2BasisWriter, encodingOptions)
+                            .then((encodedImageData) => {
+                                texture.imageData = new Uint8Array(encodedImageData);
+                                if (--countTextures <= 0) {
+                                    resolve();
+                                }
+                            }).catch((err) => {
+                            console.error("[XKTModel.finalize] Failed to encode image: " + err);
+                            if (--countTextures <= 0) {
+                                resolve();
+                            }
+                        });
+                    } else {
+                        texture.imageData = new Uint8Array(1);
+                        if (--countTextures <= 0) {
+                            resolve();
+                        }
+                    }
+                }
+            }
+        });
     }
 
     _bakeSingleUseGeometryPositions() {
@@ -864,7 +1275,7 @@ class XKTModel {
 
         const nodeAABBDiag = math.getAABB3Diag(nodeAABB);
 
-        if (nodeAABBDiag < MIN_TILE_DIAG) {
+        if (nodeAABBDiag < this.minTileSize) {
             kdNode.entities = kdNode.entities || [];
             kdNode.entities.push(entity);
             math.expandAABB3(nodeAABB, entityAABB);
@@ -982,7 +1393,7 @@ class XKTModel {
                 const mesh = meshes[j];
                 const geometry = mesh.geometry;
 
-                if (!geometry.reused) {
+                if (!geometry.reused) { // Batched geometry
 
                     const positions = geometry.positions;
 
@@ -999,10 +1410,15 @@ class XKTModel {
 
                     geometryCompression.quantizePositions(positions, positions.length, rtcAABB, geometry.positionsQuantized);
 
-                } else {
+                } else { // Instanced geometry
 
                     // Post-multiply a translation to the mesh's modeling matrix
                     // to center the entity's geometry instances to the tile RTC center
+
+                    //////////////////////////////
+                    // Why do we do this?
+                    // Seems to break various models
+                    /////////////////////////////////
 
                     math.translateMat4v(tileCenterNeg, mesh.matrix);
                 }
@@ -1028,7 +1444,7 @@ class XKTModel {
 
             const geometry = this.geometriesList [geometryIndex];
 
-            if (geometry.reused) {
+            if (geometry.reused) { // Instanced geometry
 
                 const positions = geometry.positions;
 
@@ -1077,8 +1493,8 @@ class XKTModel {
                 }
             }
         }
-        let vertexIndexMapping = new Array (maxNumPositions / 3);
-        let edges = new Array (maxNumIndices);
+        let vertexIndexMapping = new Array(maxNumPositions / 3);
+        let edges = new Array(maxNumIndices);
         for (let i = 0, len = this.geometriesList.length; i < len; i++) {
             const geometry = this.geometriesList[i];
             if (geometry.primitiveType === "triangles") {
@@ -1088,4 +1504,6 @@ class XKTModel {
     }
 }
 
-export {XKTModel};
+export {
+    XKTModel
+}

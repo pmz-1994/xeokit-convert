@@ -43,7 +43,7 @@ import {math} from "../lib/math.js";
  * @param {XKTModel} [params.xktModel] XKTModel to parse into.
  * @param {Object} [params.stats] Collects statistics.
  * @param {function} [params.log] Logging callback.
- * @returns {Promise}
+ @returns {Promise} Resolves when STL has been parsed.
  */
 async function parseSTLIntoXKTModel({
                                         data,
@@ -55,6 +55,10 @@ async function parseSTLIntoXKTModel({
                                         stats,
                                         log
                                     }) {
+
+    if (log) {
+        log("Using parser: parseSTLIntoXKTModel");
+    }
 
     return new Promise(function (resolve, reject) {
 

@@ -1,23 +1,28 @@
-import * as WebIFC from "web-ifc/web-ifc-api.js";
-
 /**
  * @desc Parses IFC STEP file data into an {@link XKTModel}.
  *
- * Internally, this function uses [web-ifc](https://github.com/tomvandig/web-ifc) to parse the IFC, which relies on a
+ * This function uses [web-ifc](https://github.com/tomvandig/web-ifc) to parse the IFC, which relies on a
  * WASM file to do the parsing.
  *
  * Depending on how we use this function, we may need to provide it with a path to the directory where that WASM file is stored.
+ *
+ * This function is tested with web-ifc version 0.0.34.
  *
  * ## Usage
  *
  * In the example below we'll create an {@link XKTModel}, then load an IFC model into it.
  *
  * ````javascript
- * utils.loadArraybuffer("./models/ifc/rac_advanced_sample_project.ifc", async (data) => {
+ * import {XKTModel, parseIFCIntoXKTModel, writeXKTModelToArrayBuffer} from "xeokit-convert.es.js";
+ *
+ * import * as WebIFC from "web-ifc-api.js";
+ *
+ * utils.loadArraybuffer("rac_advanced_sample_project.ifc", async (data) => {
  *
  *     const xktModel = new XKTModel();
  *
  *     parseIFCIntoXKTModel({
+ *          WebIFC,
  *          data,
  *          xktModel,
  *          wasmPath: "../dist/",
@@ -33,6 +38,8 @@ import * as WebIFC from "web-ifc/web-ifc-api.js";
  * ````
  *
  * @param {Object} params Parsing params.
+ * @param {Object} params.WebIFC The WebIFC library. We pass this in as an external dependency, in order to give the
+ * caller the choice of whether to use the Browser or NodeJS version.
  * @param {ArrayBuffer} [params.data] IFC file data.
  * @param {XKTModel} [params.xktModel] XKTModel to parse into.
  * @param {Boolean} [params.autoNormals=true] When true, the parser will ignore the IFC geometry normals, and the IFC
@@ -40,11 +47,15 @@ import * as WebIFC from "web-ifc/web-ifc-api.js";
  * normals will be face-aligned, and therefore the ````Viewer```` will only be able to render a flat-shaded representation
  * of the IFC model. This is ````true```` by default, because IFC models tend to look acceptable with flat-shading,
  * and we always want to minimize IFC model size wherever possible.
+ * @param {String[]} [params.includeTypes] Option to only convert objects of these types.
+ * @param {String[]} [params.excludeTypes] Option to never convert objects of these types.
  * @param {String} params.wasmPath Path to ````web-ifc.wasm````, required by this function.
- * @param {Object} [params.stats] Collects statistics.
+ * @param {Object} [params.stats={}] Collects statistics.
  * @param {function} [params.log] Logging callback.
+ * @returns {Promise} Resolves when IFC has been parsed.
  */
 function parseIFCIntoXKTModel({
+                                  WebIFC,
                                   data,
                                   xktModel,
                                   autoNormals = true,
@@ -54,6 +65,10 @@ function parseIFCIntoXKTModel({
                                   stats = {},
                                   log
                               }) {
+
+    if (log) {
+        log("Using parser: parseIFCIntoXKTModel");
+    }
 
     return new Promise(function (resolve, reject) {
 
@@ -97,6 +112,7 @@ function parseIFCIntoXKTModel({
             stats.numVertices = 0;
 
             const ctx = {
+                WebIFC,
                 modelID,
                 ifcAPI,
                 xktModel,
@@ -144,7 +160,7 @@ function parseIFCIntoXKTModel({
 
 function parsePropertySets(ctx) {
 
-    const lines = ctx.ifcAPI.GetLineIDsWithType(ctx.modelID, WebIFC.IFCRELDEFINESBYPROPERTIES);
+    const lines = ctx.ifcAPI.GetLineIDsWithType(ctx.modelID, ctx.WebIFC.IFCRELDEFINESBYPROPERTIES);
 
     for (let i = 0; i < lines.size(); i++) {
 
@@ -153,7 +169,7 @@ function parsePropertySets(ctx) {
         let rel = ctx.ifcAPI.GetLine(ctx.modelID, relID, true);
 
         if (rel) {
-            
+
             const relatingPropertyDefinition = rel.RelatingPropertyDefinition;
             if (!relatingPropertyDefinition) {
                 continue;
@@ -209,7 +225,7 @@ function parsePropertySets(ctx) {
 
 function parseMetadata(ctx) {
 
-    const lines = ctx.ifcAPI.GetLineIDsWithType(ctx.modelID, WebIFC.IFCPROJECT);
+    const lines = ctx.ifcAPI.GetLineIDsWithType(ctx.modelID, ctx.WebIFC.IFCPROJECT);
     const ifcProjectId = lines.get(0);
     const ifcProject = ctx.ifcAPI.GetLine(ctx.modelID, ifcProjectId);
 
@@ -237,7 +253,7 @@ function parseSpatialChildren(ctx, ifcElement, parentMetaObjectId) {
         ifcElement.expressID,
         'RelatingObject',
         'RelatedObjects',
-        WebIFC.IFCRELAGGREGATES,
+        ctx.WebIFC.IFCRELAGGREGATES,
         metaObjectId);
 
     parseRelatedItemsOfType(
@@ -245,7 +261,7 @@ function parseSpatialChildren(ctx, ifcElement, parentMetaObjectId) {
         ifcElement.expressID,
         'RelatingStructure',
         'RelatedElements',
-        WebIFC.IFCRELCONTAINEDINSPATIALSTRUCTURE,
+        ctx.WebIFC.IFCRELCONTAINEDINSPATIALSTRUCTURE,
         metaObjectId);
 }
 
@@ -311,89 +327,104 @@ function parseGeometry(ctx) {
     const flatMeshes = ctx.ifcAPI.LoadAllGeometry(ctx.modelID);
 
     for (let i = 0, len = flatMeshes.size(); i < len; i++) {
-
         const flatMesh = flatMeshes.get(i);
-        const flatMeshExpressID = flatMesh.expressID;
-        const placedGeometries = flatMesh.geometries;
+        createObject(ctx, flatMesh);
+    }
 
-        const meshIds = [];
+    // LoadAllGeometry does not return IFCSpace meshes
+    // here is a workaround
 
-        const properties = ctx.ifcAPI.GetLine(ctx.modelID, flatMeshExpressID);
-        const entityId = properties.GlobalId.value;
+    const lines = ctx.ifcAPI.GetLineIDsWithType(ctx.modelID, ctx.WebIFC.IFCSPACE);
+    for (let j = 0, len = lines.size(); j < len; j++) {
+        const ifcSpaceId = lines.get(j);
+        const flatMesh = ctx.ifcAPI.GetFlatMesh(ctx.modelID, ifcSpaceId);
+        createObject(ctx, flatMesh);
+    }
+}
 
-        const metaObjectId = entityId;
-        const metaObject = ctx.xktModel.metaObjects[metaObjectId];
+function createObject(ctx, flatMesh) {
 
-        if (ctx.includeTypes && (!metaObject || (!ctx.includeTypes[metaObject.metaObjectType]))) {
-            return;
-        }
+    const flatMeshExpressID = flatMesh.expressID;
+    const placedGeometries = flatMesh.geometries;
 
-        if (ctx.excludeTypes && (!metaObject || ctx.excludeTypes[metaObject.metaObjectType])) {
-            console.log("excluding: " + metaObjectId)
-            return;
-        }
+    const meshIds = [];
 
-        for (let j = 0, lenj = placedGeometries.size(); j < lenj; j++) {
+    const properties = ctx.ifcAPI.GetLine(ctx.modelID, flatMeshExpressID);
+    const entityId = properties.GlobalId.value;
 
-            const placedGeometry = placedGeometries.get(j);
-            const geometryId = "" + placedGeometry.geometryExpressID;
+    const metaObjectId = entityId;
+    const metaObject = ctx.xktModel.metaObjects[metaObjectId];
 
-            if (!ctx.xktModel.geometries[geometryId]) {
+    if (ctx.includeTypes && (!metaObject || (!ctx.includeTypes[metaObject.metaObjectType]))) {
+        return;
+    }
 
-                const geometry = ctx.ifcAPI.GetGeometry(ctx.modelID, placedGeometry.geometryExpressID);
-                const vertexData = ctx.ifcAPI.GetVertexArray(geometry.GetVertexData(), geometry.GetVertexDataSize());
-                const indices = ctx.ifcAPI.GetIndexArray(geometry.GetIndexData(), geometry.GetIndexDataSize());
+    if (ctx.excludeTypes && (!metaObject || ctx.excludeTypes[metaObject.metaObjectType])) {
+        console.log("excluding: " + metaObjectId)
+        return;
+    }
 
-                // De-interleave vertex arrays
+    for (let j = 0, lenj = placedGeometries.size(); j < lenj; j++) {
 
-                const positions = [];
-                const normals = [];
+        const placedGeometry = placedGeometries.get(j);
+        const geometryId = "" + placedGeometry.geometryExpressID;
 
-                for (let k = 0, lenk = vertexData.length / 6; k < lenk; k++) {
-                    positions.push(vertexData[k * 6 + 0]);
-                    positions.push(vertexData[k * 6 + 1]);
-                    positions.push(vertexData[k * 6 + 2]);
-                }
+        if (!ctx.xktModel.geometries[geometryId]) {
 
-                if (!ctx.autoNormals) {
-                    for (let k = 0, lenk = vertexData.length / 6; k < lenk; k++) {
-                        normals.push(vertexData[k * 6 + 3]);
-                        normals.push(vertexData[k * 6 + 4]);
-                        normals.push(vertexData[k * 6 + 5]);
-                    }
-                }
+            const geometry = ctx.ifcAPI.GetGeometry(ctx.modelID, placedGeometry.geometryExpressID);
+            const vertexData = ctx.ifcAPI.GetVertexArray(geometry.GetVertexData(), geometry.GetVertexDataSize());
+            const indices = ctx.ifcAPI.GetIndexArray(geometry.GetIndexData(), geometry.GetIndexDataSize());
 
-                ctx.xktModel.createGeometry({
-                    geometryId: geometryId,
-                    primitiveType: "triangles",
-                    positions: positions,
-                    normals: ctx.autoNormals ? null : normals,
-                    indices: indices
-                });
+            // De-interleave vertex arrays
 
-                ctx.stats.numGeometries++;
-                ctx.stats.numVertices += (positions.length / 3);
-                ctx.stats.numTriangles += (indices.length / 3);
+            const positions = [];
+            const normals = [];
+
+            for (let k = 0, lenk = vertexData.length / 6; k < lenk; k++) {
+                positions.push(vertexData[k * 6 + 0]);
+                positions.push(vertexData[k * 6 + 1]);
+                positions.push(vertexData[k * 6 + 2]);
             }
 
-            const meshId = ("mesh" + ctx.nextId++);
+            if (!ctx.autoNormals) {
+                for (let k = 0, lenk = vertexData.length / 6; k < lenk; k++) {
+                    normals.push(vertexData[k * 6 + 3]);
+                    normals.push(vertexData[k * 6 + 4]);
+                    normals.push(vertexData[k * 6 + 5]);
+                }
+            }
 
-            ctx.xktModel.createMesh({
-                meshId: meshId,
+            ctx.xktModel.createGeometry({
                 geometryId: geometryId,
-                matrix: new Float32Array(placedGeometry.flatTransformation),
-                color: [placedGeometry.color.x, placedGeometry.color.y, placedGeometry.color.z],
-                opacity: placedGeometry.color.w
+                primitiveType: "triangles",
+                positions: positions,
+                normals: ctx.autoNormals ? null : normals,
+                indices: indices
             });
 
-            meshIds.push(meshId);
+            ctx.stats.numGeometries++;
+            ctx.stats.numVertices += (positions.length / 3);
+            ctx.stats.numTriangles += (indices.length / 3);
         }
 
+        const meshId = ("mesh" + ctx.nextId++);
+
+        ctx.xktModel.createMesh({
+            meshId: meshId,
+            geometryId: geometryId,
+            matrix: new Float32Array(placedGeometry.flatTransformation),
+            color: [placedGeometry.color.x, placedGeometry.color.y, placedGeometry.color.z],
+            opacity: placedGeometry.color.w
+        });
+
+        meshIds.push(meshId);
+    }
+
+    if (meshIds.length > 0) {
         ctx.xktModel.createEntity({
             entityId: entityId,
             meshIds: meshIds
         });
-
         ctx.stats.numObjects++;
     }
 }
